@@ -2,7 +2,7 @@ import { build as buildProject } from "snowpack";
 import { dirname, resolve } from "path";
 import glob from "globby";
 import arg from "arg";
-import { GetModuleInfo, rollup } from "rollup";
+import { GetModuleInfo, rollup, RenderedChunk } from "rollup";
 import { performance } from "perf_hooks";
 import { green, dim } from "kleur/colors";
 import styles from "rollup-plugin-styles";
@@ -37,6 +37,7 @@ import {
   resolveNormalizedBasePath,
   loadConfiguration,
 } from "../utils/command.js";
+import { types, visit, print } from "recast";
 
 function parseArgs(argv: string[]) {
   return arg(
@@ -253,6 +254,7 @@ async function bundlePagesForSSR(paths: string[]) {
     plugins: [
       rewriteCssProxies(),
       rewritePreact(),
+      rewriteHydratedComponentDisplayNames(),
       styles({
         config: true,
         mode: "extract",
@@ -559,6 +561,45 @@ async function bundlePagesForSSR(paths: string[]) {
         entry.hydrateStyleBindings = null;
       return entry;
     });
+}
+
+const rewriteHydratedComponentDisplayNames = () => {
+  return {
+    name: "@microsite/rollup-rewrite-hydrated-component-display-names",
+    renderChunk(code: string, chunk: RenderedChunk) {
+      if (chunk.name.startsWith('_hydrate/')) {
+        const ast = this.parse(code);
+        const b = types.builders;
+        visit(ast, {
+          visitCallExpression(path) {
+            if (path.get('callee').getValueProperty('name') === 'withHydrate') {
+              // TODO: determine an actual exported name.
+              // Extract a constant name from a line like: 
+              // `const Component = withHydrate(...);`
+              const hydratedComponentName = path.parent.get('id').getValueProperty('name');
+              const newDisplayName = b.objectProperty(
+                b.identifier('displayName'), 
+                b.stringLiteral(hydratedComponentName)
+              );
+              // or just 
+              const existingDisplayName = path.parent.get("init",'arguments', 1, 'properties')
+                .filter((path) => path.node.key.name === 'displayName')[0];
+              // Update the existing `displayName` property or add a new one. 
+              if (existingDisplayName) {
+                existingDisplayName.replace(newDisplayName);
+              } else {
+                path.parent.get("init",'arguments', 1, 'properties').push(newDisplayName);
+              }
+              return false;
+            }
+            this.traverse(path);
+          },
+        });
+        return print(ast);
+      }
+      return null;
+    }
+  }
 }
 
 /**
